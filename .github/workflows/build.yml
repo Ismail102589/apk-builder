@@ -1,0 +1,54 @@
+name: Build APK
+
+on:
+  push:
+    paths:
+      - 'upload/project.zip'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Unzip project
+        run: |
+          mkdir -p project
+          unzip -q upload/project.zip -d project
+          if [ $(ls project | wc -l) -eq 1 ] && [ -d "project/$(ls project)" ]; then
+            mv project/*/* project/ 2>/dev/null || true
+            mv project/*/.[!.]* project/ 2>/dev/null || true
+          fi
+          ls -la project
+
+      - name: Build debug APK
+        working-directory: project
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug --no-daemon
+          else
+            gradle assembleDebug --no-daemon
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: project/**/build/outputs/apk/debug/*.apk
