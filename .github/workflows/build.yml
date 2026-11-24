@@ -1,3 +1,4 @@
+# wf-v3
 name: Build APK
 
 on:
@@ -40,15 +41,22 @@ jobs:
         run: |
           mkdir -p project
           unzip -q upload/project.zip -d project
-          if [ $(ls project | wc -l) -eq 1 ] && [ -d "project/$(ls project)" ]; then
-            mv project/*/* project/ 2>/dev/null || true
-            mv project/*/.[!.]* project/ 2>/dev/null || true
+          ROOT=""
+          for d in 1 2 3 4; do
+            F=$(find project -maxdepth $d -name 'settings.gradle*' | head -n1)
+            if [ -n "$F" ]; then ROOT=$(dirname "$F"); break; fi
+          done
+          if [ -z "$ROOT" ]; then
+            echo "::error::settings.gradle not found - this ZIP is not a Gradle Android project"
+            find project -maxdepth 3 | head -40
+            exit 1
           fi
-          ls -la project
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
 
       - name: Build debug APK
-        working-directory: project
         run: |
+          cd "$ROOT"
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
             ./gradlew assembleDebug --no-daemon
