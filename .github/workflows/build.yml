@@ -1,11 +1,15 @@
-# wf-v3
+# wf-v5
 name: Build APK
 
 on:
   push:
+    branches: [main]
     paths:
       - 'upload/project.zip'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -32,36 +36,225 @@ jobs:
             echo "$KS" | base64 -d > ~/.android/debug.keystore
           fi
 
+      - name: Prepare project
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p project bases
+          unzip -q upload/project.zip -d project
+          gh release download bases --pattern 'base-*.zip' --dir bases || true
+          python3 - <<'PY'
+          import os, re, sys, glob, shutil, zipfile
+
+          def log(*a):
+              print(*a, flush=True)
+
+          def err(code, msg):
+              print("::error::%s %s" % (code, msg), flush=True)
+              sys.exit(1)
+
+          def read(p):
+              try:
+                  return open(p, errors='ignore').read()
+              except Exception:
+                  return ''
+
+          def find_root(d):
+              best = None
+              for dp, dn, fn in os.walk(d):
+                  rel = os.path.relpath(dp, d)
+                  depth = 0 if rel == '.' else rel.count(os.sep) + 1
+                  if depth > 4:
+                      dn[:] = []
+                      continue
+                  if any(f.startswith('settings.gradle') for f in fn):
+                      if best is None or depth < best[0]:
+                          best = (depth, dp)
+              return best[1] if best else None
+
+          def pkg_key(root):
+              for dp, dn, fn in os.walk(root):
+                  dn[:] = [x for x in dn if x not in ('build', '.gradle')]
+                  for f in sorted(fn):
+                      if f in ('build.gradle', 'build.gradle.kts'):
+                          t = read(os.path.join(dp, f))
+                          m = re.search(r'namespace\s*=?\s*["\']([\w.]+)["\']', t) or re.search(r'applicationId\s*=?\s*["\']([\w.]+)["\']', t)
+                          if m:
+                              return m.group(1)
+              return ''
+
+          def patch_info(d):
+              pk, n = set(), 0
+              for dp, dn, fn in os.walk(d):
+                  for f in fn:
+                      p = os.path.join(dp, f)
+                      if f.endswith(('.kt', '.java')):
+                          n += 1
+                          m = re.search(r'^\s*package\s+([\w.]+)', read(p), re.M)
+                          if m:
+                              pk.add(m.group(1))
+                      elif f == 'AndroidManifest.xml':
+                          n += 1
+                          m = re.search(r'package\s*=\s*"([\w.]+)"', read(p))
+                          if m:
+                              pk.add(m.group(1))
+              return pk, n
+
+          def apply_patch(pdir, base):
+              mod = None
+              index = {}
+              for dp, dn, fn in os.walk(base):
+                  dn[:] = [x for x in dn if x not in ('build', '.gradle', '.git')]
+                  if 'AndroidManifest.xml' in fn and dp.replace(os.sep, '/').endswith('src/main'):
+                      m = os.path.dirname(os.path.dirname(dp))
+                      if mod is None or os.path.basename(m) == 'app':
+                          mod = m
+                  for f in fn:
+                      index.setdefault(f, []).append(os.path.join(dp, f))
+              changed = []
+              for dp, dn, fn in os.walk(pdir):
+                  for f in fn:
+                      src = os.path.join(dp, f)
+                      rp = os.path.relpath(src, pdir).replace(os.sep, '/')
+                      parts = rp.split('/')
+                      if parts[0] == '__MACOSX' or f.startswith('.'):
+                          continue
+                      tgt = None
+                      if len(parts) > 1:
+                          for k in range(len(parts) - 1):
+                              d2 = os.path.join(base, *parts[k:-1])
+                              if os.path.isdir(d2):
+                                  tgt = os.path.join(d2, f)
+                                  break
+                      if tgt is None:
+                          c = index.get(f, [])
+                          if f.endswith(('.kt', '.java')):
+                              m = re.search(r'^\s*package\s+([\w.]+)', read(src), re.M)
+                              pk = m.group(1) if m else ''
+                              pp = pk.replace('.', '/')
+                              c2 = [x for x in c if pp and os.path.dirname(x).replace(os.sep, '/').endswith(pp)]
+                              if c2:
+                                  tgt = c2[0]
+                              elif mod and pk:
+                                  tgt = os.path.join(mod, 'src', 'main', 'java', *pk.split('.'), f)
+                              elif c:
+                                  tgt = c[0]
+                          elif f == 'AndroidManifest.xml' and mod:
+                              tgt = os.path.join(mod, 'src', 'main', 'AndroidManifest.xml')
+                          elif c:
+                              pref = [x for x in c if mod and x.startswith(mod + os.sep)]
+                              tgt = (pref or c)[0]
+                      if tgt is None:
+                          log('SKIP (no place found):', rp)
+                          continue
+                      os.makedirs(os.path.dirname(tgt), exist_ok=True)
+                      shutil.copy2(src, tgt)
+                      changed.append(os.path.relpath(tgt, base))
+              return changed
+
+          root = find_root('project')
+          if root:
+              key = pkg_key(root)
+              log('FULL project at', root, 'key', key)
+          else:
+              pk, n = patch_info('project')
+              if n == 0:
+                  err('E_NOT_PROJECT', 'ZIP has no settings.gradle and no Kotlin/Java/Manifest files')
+              bases = {}
+              for z in glob.glob('bases/base-*.zip'):
+                  bases[os.path.basename(z)[5:-4]] = z
+              chosen = None
+              for k in sorted(bases, key=lambda x: x not in pk):
+                  if any(p == k or p.startswith(k + '.') or k.startswith(p + '.') for p in pk):
+                      chosen = k
+                      break
+              if not chosen:
+                  err('E_NO_BASE', 'patch for package(s) %s but no saved base project (saved: %s). Build the full project ZIP once first.' % (', '.join(sorted(pk)) or '?', ', '.join(sorted(bases)) or 'none'))
+              shutil.move('project', 'patch_in')
+              os.makedirs('project')
+              zipfile.ZipFile(bases[chosen]).extractall('project')
+              root = find_root('project')
+              if not root:
+                  err('E_NOT_PROJECT', 'saved base project is broken')
+              ch = apply_patch('patch_in', root)
+              log('PATCH applied on base', chosen, '->', len(ch), 'files:')
+              for x in ch:
+                  log('  ', x)
+              key = pkg_key(root)
+
+          with open(os.environ.get('GITHUB_ENV', '/dev/null'), 'a') as f:
+              f.write('ROOT=%s\nKEY=%s\n' % (root, key))
+          PY
+
+      - name: Pick Gradle version
+        run: |
+          cd "$ROOT"
+          V=""
+          if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            V=$(sed -nE 's/.*gradle-([0-9]+(\.[0-9]+)+)-(bin|all)\.zip.*/\1/p' gradle/wrapper/gradle-wrapper.properties | head -n1)
+          fi
+          if [ -z "$V" ]; then
+            A=$(grep -rhE 'com\.android\.(application|library)|tools\.build:gradle|^agp *=' --include=build.gradle --include=build.gradle.kts --include=settings.gradle --include=settings.gradle.kts --include=libs.versions.toml . 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+            M=$(echo "$A" | cut -d. -f1,2)
+            case "$M" in
+              7.0|7.1|7.2) V=7.3.3 ;;
+              7.3) V=7.4.2 ;;
+              7.4) V=7.5.1 ;;
+              8.0|8.1) V=8.0.2 ;;
+              8.2) V=8.2.1 ;;
+              8.3) V=8.4 ;;
+              8.4) V=8.6 ;;
+              8.5|8.6) V=8.7 ;;
+              8.7) V=8.9 ;;
+              8.8) V=8.10.2 ;;
+              8.9|8.10) V=8.11.1 ;;
+              *) V=8.13 ;;
+            esac
+            echo "AGP=$A"
+          fi
+          echo "GRADLE_VER=$V" >> "$GITHUB_ENV"
+          echo "Gradle $V"
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.7
-
-      - name: Unzip project
-        run: |
-          mkdir -p project
-          unzip -q upload/project.zip -d project
-          ROOT=""
-          for d in 1 2 3 4; do
-            F=$(find project -maxdepth $d -name 'settings.gradle*' | head -n1)
-            if [ -n "$F" ]; then ROOT=$(dirname "$F"); break; fi
-          done
-          if [ -z "$ROOT" ]; then
-            echo "::error::settings.gradle not found - this ZIP is not a Gradle Android project"
-            find project -maxdepth 3 | head -40
-            exit 1
-          fi
-          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
-          echo "Project root: $ROOT"
+          gradle-version: ${{ env.GRADLE_VER }}
 
       - name: Build debug APK
+        shell: bash
         run: |
           cd "$ROOT"
-          if [ -f ./gradlew ]; then
+          if [ -f ./gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
             chmod +x ./gradlew
-            ./gradlew assembleDebug --no-daemon
+            CMD="./gradlew"
           else
-            gradle assembleDebug --no-daemon
+            CMD="gradle"
+          fi
+          for i in 1 2 3; do
+            LOG="$GITHUB_WORKSPACE/build_$i.log"
+            set +e
+            $CMD assembleDebug --no-daemon 2>&1 | tee "$LOG"
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc" -eq 0 ]; then exit 0; fi
+            if [ "$i" -lt 3 ] && grep -qiE 'Could not (resolve|GET|HEAD|download)|timed out|Timeout|Connection (reset|refused)|Premature end|Received status code 5|SSLHandshake|Remote host terminated|Network is unreachable|Temporary failure|503 Service|502 Bad Gateway|Unable to (download|resolve)' "$LOG"; then
+              echo "Transient network error, retry $i of 2"
+              sleep $((i * 20))
+            else
+              exit "$rc"
+            fi
+          done
+
+      - name: Save project base
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$KEY" ]; then
+            ( cd "$ROOT" && zip -qr "$GITHUB_WORKSPACE/bases/base-$KEY.zip" . -x 'build/*' '*/build/*' '.gradle/*' '*/.gradle/*' '.idea/*' 'local.properties' )
+            gh release view bases >/dev/null 2>&1 || gh release create bases --title bases --notes "saved project bases"
+            gh release upload bases "bases/base-$KEY.zip" --clobber
           fi
 
       - name: Upload APK
